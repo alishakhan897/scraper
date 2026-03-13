@@ -583,8 +583,22 @@ def open_reviews_tab(page):
 
     if not safe_goto(page, reviews_url):
         return False
-    # wait for reviews container
-    page.wait_for_selector("section.like-dislike-section", timeout=30000)
+
+    review_ready_selectors = [
+        "section.like-dislike-section",
+        ".review-rating",
+        "section#reviews",
+        "h1",
+    ]
+
+    for selector in review_ready_selectors:
+        try:
+            page.wait_for_selector(selector, timeout=8000)
+            return True
+        except:
+            continue
+
+    print("Reviews page loaded but review widgets were not found. Continuing with best-effort scrape.")
     return True
 
 
@@ -2253,9 +2267,12 @@ def main(target_url="", output_file="", headless=None):
 
             # ---------- REVIEWS ----------
             reviews_data = {}
-            if open_reviews_tab(page):
-                print("Ã¢Â­Â Scraping Reviews page...")
-                reviews_data = scrape_reviews_page(page)
+            try:
+                if open_reviews_tab(page):
+                    print("Ã¢Â­Â Scraping Reviews page...")
+                    reviews_data = scrape_reviews_page(page)
+            except Exception as reviews_exc:
+                print("Reviews page scrape skipped:", reviews_exc)
             data["reviews_page"] = reviews_data
             update_mongo_section(
                 data["source_college_id"],
@@ -2334,7 +2351,10 @@ def main(target_url="", output_file="", headless=None):
 
         except Exception as e:
             print("Error:", e)
-            page.screenshot(path="error_debug.png")
+            try:
+                page.screenshot(path="error_debug.png", timeout=10000)
+            except Exception as screenshot_exc:
+                print("Screenshot capture failed:", screenshot_exc)
 
         finally:
             browser.close()
