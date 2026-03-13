@@ -1,0 +1,12 @@
+requests
+beautifulsoup4
+lxml
+playwright
+pandas
+rapidfuzz
+pymongo
+python-dotenv
+loguru
+tqdm
+fake-useragent
+tenacity
