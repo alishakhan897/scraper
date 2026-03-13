@@ -13,8 +13,8 @@ from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 RUNS_DIR = BASE_DIR / "runs"
-HOST = "0.0.0.0"
-PORT = int(os.getenv("PORT", "8000"))
+HOST = os.getenv("SCRAPER_API_HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT") or os.getenv("SCRAPER_API_PORT", "8000"))
 MAX_LOG_LINES = 400
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -93,6 +93,17 @@ def _append_bool_flag(command, payload, payload_key, cli_flag):
         command.append(cli_flag)
 
 
+def _should_run_headless(payload):
+    if "headless" in payload:
+        return bool(payload.get("headless"))
+
+    default_headless = os.getenv("SCRAPER_DEFAULT_HEADLESS", "").strip().lower()
+    if default_headless in {"1", "true", "yes", "on"}:
+        return True
+
+    return os.getenv("RENDER", "").strip().lower() == "true"
+
+
 def _append_string_list_arg(command, payload, payload_key, cli_flag):
     values = payload.get(payload_key)
     if values is None:
@@ -121,7 +132,8 @@ def _build_basic_course_command(payload, output_file):
         "--output-file",
         output_file,
     ]
-    _append_bool_flag(command, payload, "headless", "--headless")
+    if _should_run_headless(payload):
+        command.append("--headless")
     _append_int_arg(command, payload, "slow_mo", "--slow-mo")
     _append_int_arg(command, payload, "limit_courses", "--limit-courses")
     _append_int_arg(command, payload, "limit_sub_courses", "--limit-sub-courses")
@@ -145,7 +157,8 @@ def _build_course_command(payload, output_file):
         "--output-file",
         output_file,
     ]
-    _append_bool_flag(command, payload, "headless", "--headless")
+    if _should_run_headless(payload):
+        command.append("--headless")
     _append_int_arg(command, payload, "stream_limit", "--stream-limit")
     _append_int_arg(command, payload, "course_limit", "--course-limit")
     return command
