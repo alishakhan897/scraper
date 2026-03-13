@@ -3,13 +3,13 @@ services:
     name: example-scraper-api
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt && python -m playwright install --with-deps chromium
+    buildCommand: pip install -r requirements.txt && python -m playwright install chromium
     startCommand: python main.py
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.13.5
       - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/project/src/.cache/ms-playwright
+        value: /opt/render/.cache/ms-playwright
       - key: SCRAPER_DEFAULT_HEADLESS
         value: "1"

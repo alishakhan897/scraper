@@ -14,7 +14,7 @@ try:
 except:
     pass
 
-DEFAULT_URL = "https://collegedunia.com/college/18183-jaipuria-institute-of-management-lucknow"
+DEFAULT_URL = "https://collegedunia.com/university/25455-iit-delhi-indian-institute-of-technology-iitd-new-delhi"
 DEFAULT_OUTPUT_FILE = "iim_knp_full_dump.json"
 MONGO_URI = "mongodb+srv://alishakhan8488_db_user:DaVHn9goL8STNzNs@cluster0.nkmbpqt.mongodb.net/studentcap?retryWrites=true&w=majority"
 MONGO_DB = "studentcap"
