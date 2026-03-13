@@ -5,6 +5,7 @@ playwright
 pandas
 rapidfuzz
 pymongo
+dnspython
 python-dotenv
 loguru
 tqdm

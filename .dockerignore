@@ -1,0 +1,11 @@
+.git
+__pycache__/
+*.pyc
+.venv/
+venv/
+runs/
+*.log
+*.png
+*_dump.json
+basic_college_courses.json
+engineering_courses.json

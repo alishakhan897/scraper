@@ -1,15 +1,20 @@
 services:
   - type: web
     name: example-scraper-api
-    runtime: python
+    runtime: docker
     plan: free
-    buildCommand: pip install -r requirements.txt && python -m playwright install chromium
-    startCommand: python main.py
+    dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.13.5
       - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/.cache/ms-playwright
+        value: /ms-playwright
+      - key: PYTHONUNBUFFERED
+        value: "1"
       - key: SCRAPER_DEFAULT_HEADLESS
         value: "1"
+      - key: SCRAPER_MAX_CONCURRENT_JOBS
+        value: "1"
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB
+        value: studentcap

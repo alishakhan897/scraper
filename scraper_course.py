@@ -9,16 +9,30 @@ from pymongo import MongoClient
 
 DEFAULT_COURSES_URL = "https://collegedunia.com/courses"
 COURSES_URL = DEFAULT_COURSES_URL
-MONGO_URI = "mongodb+srv://alishakhan8488_db_user:DaVHn9goL8STNzNs@cluster0.nkmbpqt.mongodb.net/studentcap?retryWrites=true&w=majority"
-MONGO_DB = "studentcap"
-MONGO_COLLECTION = "maincourse"
+MONGO_URI = os.getenv(
+    "MONGO_URI",
+    "mongodb+srv://alishakhan8488_db_user:DaVHn9goL8STNzNs@cluster0.nkmbpqt.mongodb.net/studentcap?retryWrites=true&w=majority",
+)
+MONGO_DB = os.getenv("MONGO_DB", "studentcap")
+MONGO_COLLECTION = os.getenv("SCRAPER_COURSE_MONGO_COLLECTION", "maincourse")
 DEFAULT_OUTPUT_FILE = "engineering_courses.json"
 OUTPUT_FILE = DEFAULT_OUTPUT_FILE
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--disable-dev-shm-usage",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
 ]
+
+
+def _default_headless():
+    return os.getenv("SCRAPER_DEFAULT_HEADLESS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    } or os.getenv("RENDER", "").strip().lower() == "true"
 
 
 def _parse_args():
@@ -37,8 +51,15 @@ def _parse_args():
     )
     parser.add_argument(
         "--headless",
+        dest="headless",
         action="store_true",
         help="Run browser in headless mode.",
+    )
+    parser.add_argument(
+        "--headed",
+        dest="headless",
+        action="store_false",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--stream-limit",
@@ -52,6 +73,7 @@ def _parse_args():
         default=2,
         help="Limit courses scraped per stream (0 = no limit).",
     )
+    parser.set_defaults(headless=_default_headless())
     return parser.parse_args()
 
 

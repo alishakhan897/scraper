@@ -16,9 +16,30 @@ except Exception:
 
 DEFAULT_URL = "https://collegedunia.com/university/25948-iit-kanpur-indian-institute-of-technology-iitk-kanpur/courses-fees"
 DEFAULT_OUTPUT_FILE = "basic_college_courses.json"
-MONGO_URI = "mongodb+srv://alishakhan8488_db_user:DaVHn9goL8STNzNs@cluster0.nkmbpqt.mongodb.net/studentcap?retryWrites=true&w=majority"
-MONGO_DB = "studentcap"
-MONGO_COLLECTION = "college_course"
+MONGO_URI = os.getenv(
+    "MONGO_URI",
+    "mongodb+srv://alishakhan8488_db_user:DaVHn9goL8STNzNs@cluster0.nkmbpqt.mongodb.net/studentcap?retryWrites=true&w=majority",
+)
+MONGO_DB = os.getenv("MONGO_DB", "studentcap")
+MONGO_COLLECTION = os.getenv(
+    "SCRAPER_BASIC_COLLEGE_COURSE_MONGO_COLLECTION",
+    "college_course",
+)
+BROWSER_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-dev-shm-usage",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+]
+
+
+def _default_headless():
+    return os.getenv("SCRAPER_DEFAULT_HEADLESS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    } or os.getenv("RENDER", "").strip().lower() == "true"
 
 
 def _parse_args():
@@ -37,8 +58,15 @@ def _parse_args():
     )
     parser.add_argument(
         "--headless",
+        dest="headless",
         action="store_true",
         help="Run browser in headless mode. Default is headed so progress is visible.",
+    )
+    parser.add_argument(
+        "--headed",
+        dest="headless",
+        action="store_false",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--slow-mo",
@@ -88,7 +116,11 @@ def _parse_args():
         default=0,
         help="Limit TOC sections per course while fetching details (0 = no limit).",
     )
-    parser.set_defaults(fetch_course_detail=True, fetch_sub_course_detail=True)
+    parser.set_defaults(
+        fetch_course_detail=True,
+        fetch_sub_course_detail=True,
+        headless=_default_headless(),
+    )
     return parser.parse_args()
 
 
@@ -105,7 +137,7 @@ def _resolve_output_file(cli_output_file=""):
 
 
 def _launch_browser(playwright, headless, slow_mo):
-    launch_kwargs = {"headless": headless}
+    launch_kwargs = {"headless": headless, "args": BROWSER_ARGS}
     if isinstance(slow_mo, int) and slow_mo > 0:
         launch_kwargs["slow_mo"] = slow_mo
 

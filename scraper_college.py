@@ -16,9 +16,27 @@ except:
 
 DEFAULT_URL = "https://collegedunia.com/university/25455-iit-delhi-indian-institute-of-technology-iitd-new-delhi"
 DEFAULT_OUTPUT_FILE = "iim_knp_full_dump.json"
-MONGO_URI = "mongodb+srv://alishakhan8488_db_user:DaVHn9goL8STNzNs@cluster0.nkmbpqt.mongodb.net/studentcap?retryWrites=true&w=majority"
-MONGO_DB = "studentcap"
-MONGO_COLLECTION = "new_college"
+MONGO_URI = os.getenv(
+    "MONGO_URI",
+    "mongodb+srv://alishakhan8488_db_user:DaVHn9goL8STNzNs@cluster0.nkmbpqt.mongodb.net/studentcap?retryWrites=true&w=majority",
+)
+MONGO_DB = os.getenv("MONGO_DB", "studentcap")
+MONGO_COLLECTION = os.getenv("SCRAPER_COLLEGE_MONGO_COLLECTION", "new_college")
+BROWSER_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-dev-shm-usage",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+]
+
+
+def _default_headless():
+    return os.getenv("SCRAPER_DEFAULT_HEADLESS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    } or os.getenv("RENDER", "").strip().lower() == "true"
 
 
 def parse_args():
@@ -36,6 +54,18 @@ def parse_args():
         help="Write scraped JSON to this path instead of the default output file.",
     )
     parser.add_argument(
+        "--headless",
+        dest="headless",
+        action="store_true",
+        help="Run browser in headless mode.",
+    )
+    parser.add_argument(
+        "--headed",
+        dest="headless",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--update-existing-placements",
         action="store_true",
         help="Update placement data for existing MongoDB colleges instead of scraping one URL.",
@@ -46,6 +76,7 @@ def parse_args():
         default=None,
         help="Limit colleges when using --update-existing-placements.",
     )
+    parser.set_defaults(headless=_default_headless())
     return parser.parse_args()
 
 
@@ -2098,7 +2129,7 @@ def _extract_cli_limit():
 
     return None
 
-def update_existing_college_placements(limit=None):
+def update_existing_college_placements(limit=None, headless=None):
     colleges = fetch_existing_colleges_for_placement_update(limit=limit)
     if not colleges:
         print("No existing colleges found for placement update.")
@@ -2108,12 +2139,8 @@ def update_existing_college_placements(limit=None):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox"
-            ]
+            headless=_default_headless() if headless is None else headless,
+            args=BROWSER_ARGS,
         )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121",
@@ -2155,7 +2182,7 @@ def update_existing_college_placements(limit=None):
         finally:
             browser.close()
 # ---------------- MAIN ----------------
-def main(target_url="", output_file=""):
+def main(target_url="", output_file="", headless=None):
     active_url = _resolve_runtime_url(target_url)
     active_output_file = _resolve_output_file(output_file)
 
@@ -2178,12 +2205,8 @@ def main(target_url="", output_file=""):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox"
-            ]
+            headless=_default_headless() if headless is None else headless,
+            args=BROWSER_ARGS,
         )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121",
@@ -2229,10 +2252,11 @@ def main(target_url="", output_file=""):
 
 
             # ---------- REVIEWS ----------
+            reviews_data = {}
             if open_reviews_tab(page):
                 print("Ã¢Â­Â Scraping Reviews page...")
                 reviews_data = scrape_reviews_page(page)
-                data["reviews_page"] = reviews_data 
+            data["reviews_page"] = reviews_data
             update_mongo_section(
                 data["source_college_id"],
                 "reviews_page",
@@ -2326,6 +2350,6 @@ def main(target_url="", output_file=""):
 if __name__ == "__main__":
     args = parse_args()
     if args.update_existing_placements:
-        update_existing_college_placements(limit=args.limit)
+        update_existing_college_placements(limit=args.limit, headless=args.headless)
     else:
-        main(target_url=args.url, output_file=args.output_file)
+        main(target_url=args.url, output_file=args.output_file, headless=args.headless)

@@ -1,10 +1,14 @@
 import argparse
+import os
 import re
 from pymongo import MongoClient, ReplaceOne
 
 
-DEFAULT_MONGO_URI = "mongodb+srv://alishakhan8488_db_user:DaVHn9goL8STNzNs@cluster0.nkmbpqt.mongodb.net/studentcap?retryWrites=true&w=majority"
-DEFAULT_DB = "studentcap"
+DEFAULT_MONGO_URI = os.getenv(
+    "MONGO_URI",
+    "mongodb+srv://alishakhan8488_db_user:DaVHn9goL8STNzNs@cluster0.nkmbpqt.mongodb.net/studentcap?retryWrites=true&w=majority",
+)
+DEFAULT_DB = os.getenv("MONGO_DB", "studentcap")
 DEFAULT_COLLECTIONS = ["college_course", "new_college", "maincourse"]
 DEFAULT_SOURCE_TEXT = "collegedunia"
 DEFAULT_TARGET_TEXT = "studycups"

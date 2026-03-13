@@ -20,6 +20,20 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 
 
+def _env_int(name, default):
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_CONCURRENT_JOBS = _env_int(
+    "SCRAPER_MAX_CONCURRENT_JOBS",
+    1 if os.getenv("RENDER", "").strip().lower() == "true" else 2,
+)
+JOB_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_JOBS)
+
+
 def _resolve_python_executable():
     venv_python = BASE_DIR / "venv" / "Scripts" / "python.exe"
     if venv_python.exists():
@@ -166,7 +180,7 @@ def _build_course_command(payload, output_file):
 
 def _build_college_command(payload, output_file):
     url = _require_url(payload)
-    return [
+    command = [
         PYTHON_EXECUTABLE,
         "scraper_college.py",
         "--url",
@@ -174,6 +188,9 @@ def _build_college_command(payload, output_file):
         "--output-file",
         output_file,
     ]
+    if _should_run_headless(payload):
+        command.append("--headless")
+    return command
 
 
 def _build_change_profile_command(payload, _output_file):
@@ -272,62 +289,95 @@ def _append_job_log(job_id, line):
             job["log_truncated"] = True
 
 
-def _run_job(job_id):
+def _summarize_jobs():
+    summary = {"queued": 0, "running": 0, "completed": 0, "failed": 0}
     with JOBS_LOCK:
-        job = JOBS[job_id]
-        job["status"] = "running"
-        job["started_at"] = _now_iso()
-        job["started_monotonic"] = time.monotonic()
-        command = list(job["command"])
+        for job in JOBS.values():
+            status = job.get("status", "queued")
+            summary[status] = summary.get(status, 0) + 1
+    summary["max_concurrent_jobs"] = MAX_CONCURRENT_JOBS
+    return summary
 
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
 
+def _run_job(job_id):
+    acquired_slot = False
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=str(BASE_DIR),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=env,
-        )
+        JOB_SEMAPHORE.acquire()
+        acquired_slot = True
+
+        with JOBS_LOCK:
+            job = JOBS[job_id]
+            job["status"] = "running"
+            job["started_at"] = _now_iso()
+            job["started_monotonic"] = time.monotonic()
+            command = list(job["command"])
+
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(BASE_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=env,
+            )
+        except Exception as exc:
+            with JOBS_LOCK:
+                job = JOBS[job_id]
+                started_monotonic = job.get("started_monotonic")
+                job["status"] = "failed"
+                job["completed_at"] = _now_iso()
+                job["duration_seconds"] = round(
+                    time.monotonic() - started_monotonic,
+                    3,
+                ) if started_monotonic else 0
+                job["error"] = str(exc)
+                job["returncode"] = None
+                job.pop("started_monotonic", None)
+            return
+
+        with JOBS_LOCK:
+            JOBS[job_id]["pid"] = process.pid
+
+        if process.stdout is not None:
+            for raw_line in process.stdout:
+                _append_job_log(job_id, raw_line)
+
+        returncode = process.wait()
+
+        with JOBS_LOCK:
+            job = JOBS[job_id]
+            started_monotonic = job.get("started_monotonic")
+            job["completed_at"] = _now_iso()
+            job["duration_seconds"] = round(
+                time.monotonic() - started_monotonic,
+                3,
+            ) if started_monotonic else None
+            job["returncode"] = returncode
+            job["status"] = "completed" if returncode == 0 else "failed"
+            job.pop("started_monotonic", None)
     except Exception as exc:
         with JOBS_LOCK:
             job = JOBS[job_id]
+            started_monotonic = job.get("started_monotonic")
             job["status"] = "failed"
             job["completed_at"] = _now_iso()
             job["duration_seconds"] = round(
-                time.monotonic() - job["started_monotonic"],
+                time.monotonic() - started_monotonic,
                 3,
-            )
+            ) if started_monotonic else None
             job["error"] = str(exc)
             job["returncode"] = None
             job.pop("started_monotonic", None)
-        return
-
-    with JOBS_LOCK:
-        JOBS[job_id]["pid"] = process.pid
-
-    if process.stdout is not None:
-        for raw_line in process.stdout:
-            _append_job_log(job_id, raw_line)
-
-    returncode = process.wait()
-
-    with JOBS_LOCK:
-        job = JOBS[job_id]
-        job["completed_at"] = _now_iso()
-        job["duration_seconds"] = round(
-            time.monotonic() - job["started_monotonic"],
-            3,
-        )
-        job["returncode"] = returncode
-        job["status"] = "completed" if returncode == 0 else "failed"
-        job.pop("started_monotonic", None)
+    finally:
+        if acquired_slot:
+            JOB_SEMAPHORE.release()
 
 
 def _start_job(task_name, payload):
@@ -424,6 +474,7 @@ class ScraperRequestHandler(BaseHTTPRequestHandler):
                     "status": "ok",
                     "python": PYTHON_EXECUTABLE,
                     "base_dir": str(BASE_DIR),
+                    "jobs": _summarize_jobs(),
                 },
             )
             return
