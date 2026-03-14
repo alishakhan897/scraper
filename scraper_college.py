@@ -5,6 +5,7 @@ import time
 import sys
 import argparse
 import os
+from datetime import datetime, timezone
 from pymongo import MongoClient
 
 try:
@@ -22,6 +23,7 @@ MONGO_URI = os.getenv(
 )
 MONGO_DB = os.getenv("MONGO_DB", "studentcap")
 MONGO_COLLECTION = os.getenv("SCRAPER_COLLEGE_MONGO_COLLECTION", "new_college")
+SOURCE_NAME = os.getenv("SCRAPER_SOURCE_NAME", "collegedunia")
 BROWSER_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--disable-dev-shm-usage",
@@ -93,16 +95,103 @@ def _resolve_output_file(cli_output_file=""):
 
 # ---------------- UTILITIES ----------------
 def safe_goto(page, url, retries=3):
+    last_error = None
     for i in range(retries):
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(900)
             return True
         except Exception as e:
-            print(f"Retry {i+1} for:", url)
+            last_error = e
+            print(f"Retry {i+1} for {url}: {e}")
             time.sleep(3)
 
-    print("Failed to load:", url)
+    print(f"Failed to load: {url} ({last_error})")
     return False
+
+
+def _page_heading_text(page):
+    try:
+        heading = page.locator("h1")
+        if heading.count() > 0:
+            return " ".join(heading.first.inner_text().split())
+    except Exception:
+        pass
+    return ""
+
+
+def _wait_for_dom_selector(page, selector, timeout_ms=30000, poll_ms=500, min_text_length=1):
+    deadline = time.time() + (timeout_ms / 1000.0)
+    last_snapshot = {}
+    last_error = None
+    readiness_script = """
+    (sel) => {
+        const el = document.querySelector(sel);
+        if (!el) {
+            return { found: false, visible: false, textLength: 0 };
+        }
+
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        const text = (el.innerText || el.textContent || "").trim();
+
+        return {
+            found: true,
+            visible: style.display !== "none" &&
+                style.visibility !== "hidden" &&
+                rect.width > 0 &&
+                rect.height > 0,
+            textLength: text.length
+        };
+    }
+    """
+
+    while time.time() < deadline:
+        try:
+            snapshot = page.evaluate(readiness_script, selector) or {}
+            last_snapshot = snapshot
+            if (
+                snapshot.get("found")
+                and snapshot.get("visible")
+                and snapshot.get("textLength", 0) >= min_text_length
+            ):
+                return True
+        except Exception as exc:
+            last_error = exc
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=min(poll_ms, 1000))
+        except Exception:
+            pass
+        page.wait_for_timeout(poll_ms)
+
+    details = (
+        f"selector={selector}, found={last_snapshot.get('found')}, "
+        f"visible={last_snapshot.get('visible')}, textLength={last_snapshot.get('textLength', 0)}, "
+        f"url={page.url}, h1={_page_heading_text(page)!r}"
+    )
+    if last_error:
+        raise RuntimeError(f"{details}, last_error={last_error}")
+    raise RuntimeError(details)
+
+
+def _wait_for_listing_article(page, section_name, timeout_ms=30000):
+    try:
+        page.wait_for_load_state("networkidle", timeout=8000)
+    except Exception:
+        pass
+
+    try:
+        _wait_for_dom_selector(
+            page,
+            "#listing-article",
+            timeout_ms=timeout_ms,
+            poll_ms=500,
+            min_text_length=40,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"{section_name} page listing article not ready: {exc}") from exc
+    page.wait_for_timeout(1200)
 
 def extract_college_id(url: str) -> int:
     m = re.search(r"/(?:university|college)/(\d+)", url)
@@ -122,15 +211,36 @@ def open_admission_tab(page):
 
     # already on admission
     if current_url.endswith("/admission"):
+        _wait_for_listing_article(page, "admission")
         return True
 
     admission_url = current_url + "/admission"
 
-    print("Ã¢Å¾Â¡Ã¯Â¸Â Opening Admission page:", admission_url)
-    page.goto(admission_url, timeout=60000, wait_until="domcontentloaded")
-    page.wait_for_selector("#listing-article", timeout=30000)
-    time.sleep(2)
-    return True
+    print("Opening Admission page:", admission_url)
+
+    last_error = None
+    for attempt in range(1, 4):
+        if not safe_goto(page, admission_url, retries=1):
+            last_error = RuntimeError(f"Navigation failed for {admission_url}")
+            continue
+
+        try:
+            _wait_for_listing_article(page, "admission")
+            return True
+        except Exception as exc:
+            last_error = exc
+            print(f"[admission] attempt {attempt}/3 not ready: {exc}")
+
+            if attempt < 3:
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(1200)
+                except Exception as reload_exc:
+                    print(f"[admission] reload after attempt {attempt} failed: {reload_exc}")
+
+    if last_error:
+        raise last_error
+    return False
 
 def expand_read_more(page):
     # multiple possible selectors
@@ -2103,6 +2213,108 @@ def update_mongo_section(college_id, section_name, section_data):
     finally:
         client.close()
 
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _record_scrape_error(scrape_errors, section_name, exc):
+    error_payload = {
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+    }
+    scrape_errors[section_name] = error_payload
+    print(
+        f"[warn] {section_name} scrape failed: "
+        f"{error_payload['error_type']}: {error_payload['error_message']}"
+    )
+
+
+def _normalize_section_defaults(data):
+    normalized = dict(data)
+    normalized.setdefault("basic", {})
+    normalized.setdefault("admission", {})
+    normalized.setdefault("reviews_page", {})
+    normalized.setdefault("ranking", {})
+    normalized.setdefault("placement", {})
+    normalized.setdefault("faculty", {"members": []})
+    normalized.setdefault("cutoff", {})
+    normalized.setdefault("scholarship", {})
+    normalized.setdefault("gallery", [])
+    normalized.setdefault("qna", [])
+    return normalized
+
+
+def _build_location(city, state):
+    parts = []
+    for value in [city, state]:
+        cleaned = " ".join(str(value or "").split()).strip()
+        if cleaned:
+            parts.append(cleaned)
+    return ", ".join(parts)
+
+
+def build_college_document(data, scrape_errors=None):
+    normalized = _normalize_section_defaults(data)
+    basic = normalized.get("basic", {}) if isinstance(normalized.get("basic"), dict) else {}
+    content = {
+        "basic": normalized.get("basic", {}),
+        "admission": normalized.get("admission", {}),
+        "reviews_page": normalized.get("reviews_page", {}),
+        "ranking": normalized.get("ranking", {}),
+        "placement": normalized.get("placement", {}),
+        "faculty": normalized.get("faculty", {"members": []}),
+        "cutoff": normalized.get("cutoff", {}),
+        "scholarship": normalized.get("scholarship", {}),
+        "gallery": normalized.get("gallery", []),
+        "qna": normalized.get("qna", []),
+    }
+
+    document = {
+        "source": SOURCE_NAME,
+        "source_college_id": normalized.get("source_college_id"),
+        "url": normalized.get("url", ""),
+        "scrape_errors": scrape_errors or {},
+        "id": normalized.get("source_college_id"),
+        "name": basic.get("name", ""),
+        "location": _build_location(basic.get("city", ""), basic.get("state", "")),
+        "rating": basic.get("rating"),
+        "reviewCount": basic.get("reviews"),
+        "updatedAt": _now_iso(),
+        "stream": normalized.get("stream", ""),
+        "avg_fees": normalized.get("avg_fees"),
+        "feesRange": normalized.get("feesRange", {}),
+        "heroDownloaded": bool(normalized.get("heroImage")),
+        "heroImage": normalized.get("heroImage", ""),
+        "heroImages": normalized.get("heroImages", []),
+        "accreditation": normalized.get("accreditation"),
+        "affiliations": normalized.get("affiliations", []),
+        "content": content,
+        "basic": content["basic"],
+        "admission": content["admission"],
+        "reviews_page": content["reviews_page"],
+        "ranking": content["ranking"],
+        "placement": content["placement"],
+        "faculty": content["faculty"],
+        "cutoff": content["cutoff"],
+        "scholarship": content["scholarship"],
+        "gallery": content["gallery"],
+        "qna": content["qna"],
+    }
+    return document
+
+
+def save_college_document(document):
+    client = MongoClient(MONGO_URI)
+
+    try:
+        coll = client[MONGO_DB][MONGO_COLLECTION]
+        college_id = document.get("source_college_id")
+        selector = {"source_college_id": college_id} if college_id else {"url": document.get("url")}
+        coll.replace_one(selector, document, upsert=True)
+    finally:
+        client.close()
+
 def fetch_existing_colleges_for_placement_update(limit=None):
     client = MongoClient(MONGO_URI)
 
@@ -2199,10 +2411,11 @@ def update_existing_college_placements(limit=None, headless=None):
 def main(target_url="", output_file="", headless=None):
     active_url = _resolve_runtime_url(target_url)
     active_output_file = _resolve_output_file(output_file)
+    college_id = extract_college_id(active_url)
 
     data = {
-        "source": "collegedunia",
-        "source_college_id": extract_college_id(active_url),
+        "source": SOURCE_NAME,
+        "source_college_id": college_id,
         "url": active_url,
         "basic": {
             "name": "",
@@ -2214,8 +2427,9 @@ def main(target_url="", output_file="", headless=None):
             "rating": None,
             "reviews": None,
             "about": {},
-        }
+        },
     }
+    scrape_errors = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -2233,124 +2447,78 @@ def main(target_url="", output_file="", headless=None):
             page.goto(active_url, timeout=60000, wait_until="domcontentloaded")
             page.wait_for_selector("h1", timeout=30000)
 
-            scrape_basic_header(page, data["basic"])
-            scrape_about_and_toc(page, data["basic"]) 
-            update_mongo_section(
-                data["source_college_id"],
-                "basic",
-                data["basic"]
-            )
+            try:
+                scrape_basic_header(page, data["basic"])
+                scrape_about_and_toc(page, data["basic"])
+            except Exception as exc:
+                _record_scrape_error(scrape_errors, "basic", exc)
 
-            # ---------- ADMISSION ----------
-            if open_admission_tab(page):
-                print("Ã°Å¸â€œËœ Scraping Admission page...")
-                expand_read_more(page)
-                admission_data = {}
-                scrape_about_and_toc(page, admission_data)
+            try:
+                if open_admission_tab(page):
+                    print("Ã°Å¸â€œËœ Scraping Admission page...")
+                    expand_read_more(page)
+                    admission_data = {}
+                    scrape_about_and_toc(page, admission_data)
 
-                important_dates = scrape_important_dates(page)
-                if important_dates.get("important_events") or important_dates.get("expired_events"):
-                    admission_data["important_dates"] = important_dates
+                    important_dates = scrape_important_dates(page)
+                    if important_dates.get("important_events") or important_dates.get("expired_events"):
+                        admission_data["important_dates"] = important_dates
 
-               # TOC click-based scraping
-                toc_clicked = scrape_toc_by_clicking(page)
-                if toc_clicked:
-                    admission_data.setdefault("toc_sections", []).extend(toc_clicked)
+                    toc_clicked = scrape_toc_by_clicking(page)
+                    if toc_clicked:
+                        admission_data.setdefault("toc_sections", []).extend(toc_clicked)
 
-                data["admission"] = admission_data
-                update_mongo_section(
-                    data["source_college_id"],
-                    "admission",
-                    admission_data
-                )
+                    data["admission"] = admission_data
+            except Exception as exc:
+                _record_scrape_error(scrape_errors, "admission", exc)
 
-
-            # ---------- REVIEWS ----------
-            reviews_data = {}
             try:
                 if open_reviews_tab(page):
                     print("Ã¢Â­Â Scraping Reviews page...")
-                    reviews_data = scrape_reviews_page(page)
-            except Exception as reviews_exc:
-                print("Reviews page scrape skipped:", reviews_exc)
-            data["reviews_page"] = reviews_data
-            update_mongo_section(
-                data["source_college_id"],
-                "reviews_page",
-                reviews_data
-            )
+                    data["reviews_page"] = scrape_reviews_page(page)
+            except Exception as exc:
+                _record_scrape_error(scrape_errors, "reviews_page", exc)
 
-            ranking_data = scrape_ranking_page(page)
-            data["ranking"] = ranking_data 
-            update_mongo_section(
-                data["source_college_id"],
-                "ranking",
-                ranking_data
-            )
+            try:
+                data["ranking"] = scrape_ranking_page(page)
+            except Exception as exc:
+                _record_scrape_error(scrape_errors, "ranking", exc)
 
-            # ---------- PLACEMENT ----------
-            placement_data = scrape_placement_page(page)
-            data["placement"] = placement_data
-            update_mongo_section(
-                data["source_college_id"],
-                "placement",
-                 placement_data
-                )
+            try:
+                data["placement"] = scrape_placement_page(page)
+            except Exception as exc:
+                _record_scrape_error(scrape_errors, "placement", exc)
 
-            # ---------- FACULTY ----------
-            faculty_data = scrape_faculty_page(page)
-            data["faculty"] = faculty_data
-            update_mongo_section(
-                data["source_college_id"],
-                "faculty",
-                faculty_data
-            )
-                # ---------- CUTOFF ----------
-            cutoff_data = scrape_cutoff_page(page)
-            data["cutoff"] = cutoff_data
-            update_mongo_section(
-                data["source_college_id"],
-                "cutoff",
-                cutoff_data
-            )
-            scholarship_data = scrape_scholarship_page(page)
-            data["scholarship"] = scholarship_data
-            
-            update_mongo_section(
-                data["source_college_id"],
-                "scholarship",
-                scholarship_data
-            )
-            # ---------- GALLERY ----------
-            print("Ã°Å¸â€“Â¼Ã¯Â¸Â Scraping Gallery images...")
-            gallery_images = scrape_gallery_images(page, active_url)
-            data["gallery"] = gallery_images 
-            update_mongo_section(
-                data["source_college_id"],
-                "gallery",
-                gallery_images
-            )
+            try:
+                data["faculty"] = scrape_faculty_page(page)
+            except Exception as exc:
+                _record_scrape_error(scrape_errors, "faculty", exc)
 
-                # ---------- QnA ----------
-            
-            page.mouse.wheel(0, 2000)
-            page.wait_for_timeout(1500)
-         
+            try:
+                data["cutoff"] = scrape_cutoff_page(page)
+            except Exception as exc:
+                _record_scrape_error(scrape_errors, "cutoff", exc)
 
+            try:
+                data["scholarship"] = scrape_scholarship_page(page)
+            except Exception as exc:
+                _record_scrape_error(scrape_errors, "scholarship", exc)
 
-            data["qna"] = scrape_all_qna(
-                page,
-                extract_college_id(active_url)
-            )
-            update_mongo_section(
-                data["source_college_id"],
-                "qna",
-                data["qna"]
-            )
+            try:
+                print("Ã°Å¸â€“Â¼Ã¯Â¸Â Scraping Gallery images...")
+                data["gallery"] = scrape_gallery_images(page, active_url)
+            except Exception as exc:
+                _record_scrape_error(scrape_errors, "gallery", exc)
 
+            try:
+                page.mouse.wheel(0, 2000)
+                page.wait_for_timeout(1500)
+                data["qna"] = scrape_all_qna(page, college_id)
+            except Exception as exc:
+                _record_scrape_error(scrape_errors, "qna", exc)
 
-        except Exception as e:
-            print("Error:", e)
+        except Exception as exc:
+            _record_scrape_error(scrape_errors, "__fatal__", exc)
             try:
                 page.screenshot(path="error_debug.png", timeout=10000)
             except Exception as screenshot_exc:
@@ -2359,13 +2527,16 @@ def main(target_url="", output_file="", headless=None):
         finally:
             browser.close()
 
-    with open(active_output_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    final_document = build_college_document(data, scrape_errors=scrape_errors)
 
-    #save_to_mongo(data)
+    with open(active_output_file, "w", encoding="utf-8") as f:
+        json.dump(final_document, f, indent=2, ensure_ascii=False)
+
+    save_college_document(final_document)
 
     print(f"Data saved to {active_output_file}")
     print(f"Data upserted to MongoDB collection: {MONGO_COLLECTION}")
+
 
 if __name__ == "__main__":
     args = parse_args()
