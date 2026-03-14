@@ -2372,6 +2372,7 @@ def main():
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121",
             viewport={"width": 1440, "height": 1000},
+            service_workers="block",
         )
         context.route("**/*", _route_handler)
         page = context.new_page()
@@ -2389,6 +2390,10 @@ def main():
                 source_college_id=output["college_id"],
             )
         finally:
+            try:
+                context.close()
+            except Exception:
+                pass
             browser.close()
 
     with open(output_file, "w", encoding="utf-8") as f:

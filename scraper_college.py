@@ -30,6 +30,7 @@ BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
 ]
+BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
 
 
 def _default_headless():
@@ -39,6 +40,13 @@ def _default_headless():
         "yes",
         "on",
     } or os.getenv("RENDER", "").strip().lower() == "true"
+
+
+def _route_handler(route):
+    if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+        route.abort()
+    else:
+        route.continue_()
 
 
 def parse_args():
@@ -2370,8 +2378,10 @@ def update_existing_college_placements(limit=None, headless=None):
         )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121",
-            viewport={"width": 1920, "height": 1080}
+            viewport={"width": 1920, "height": 1080},
+            service_workers="block",
         )
+        context.route("**/*", _route_handler)
         page = context.new_page()
 
         try:
@@ -2406,6 +2416,10 @@ def update_existing_college_placements(limit=None, headless=None):
                 except Exception as e:
                     print(f"Placement update failed for {college_url}: {e}")
         finally:
+            try:
+                context.close()
+            except Exception:
+                pass
             browser.close()
 # ---------------- MAIN ----------------
 def main(target_url="", output_file="", headless=None):
@@ -2438,8 +2452,10 @@ def main(target_url="", output_file="", headless=None):
         )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121",
-            viewport={"width": 1920, "height": 1080}
+            viewport={"width": 1920, "height": 1080},
+            service_workers="block",
         )
+        context.route("**/*", _route_handler)
         page = context.new_page()
 
         try:
@@ -2525,6 +2541,10 @@ def main(target_url="", output_file="", headless=None):
                 print("Screenshot capture failed:", screenshot_exc)
 
         finally:
+            try:
+                context.close()
+            except Exception:
+                pass
             browser.close()
 
     final_document = build_college_document(data, scrape_errors=scrape_errors)

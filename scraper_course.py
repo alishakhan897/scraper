@@ -24,6 +24,7 @@ BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
 ]
+BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
 
 
 def _default_headless():
@@ -33,6 +34,13 @@ def _default_headless():
         "yes",
         "on",
     } or os.getenv("RENDER", "").strip().lower() == "true"
+
+
+def _route_handler(route):
+    if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+        route.abort()
+    else:
+        route.continue_()
 
 
 def _parse_args():
@@ -1212,7 +1220,9 @@ def main():
             user_agent=DEFAULT_USER_AGENT,
             viewport={"width": 1440, "height": 1000},
             locale="en-US",
+            service_workers="block",
         )
+        context.route("**/*", _route_handler)
         context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
         context.add_init_script(
             """
@@ -1277,6 +1287,10 @@ def main():
 
             data["final_url"] = page.url
         finally:
+            try:
+                context.close()
+            except Exception:
+                pass
             browser.close()
 
     data["stream_count"] = len(data.get("streams", []))
