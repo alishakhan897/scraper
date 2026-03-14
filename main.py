@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 RUNS_DIR = BASE_DIR / "runs"
+JOBS_DIR = RUNS_DIR / "jobs"
 HOST = os.getenv("SCRAPER_API_HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT") or os.getenv("SCRAPER_API_PORT", "8000"))
 MAX_LOG_LINES = 400
@@ -265,6 +266,7 @@ def _job_view(job, include_logs=False):
         "pid": job.get("pid"),
         "command": job["command"],
         "output_file": job.get("output_file"),
+        "output_exists": _job_output_exists(job),
         "duration_seconds": job.get("duration_seconds"),
         "payload": job["payload"],
         "error": job.get("error"),
@@ -274,6 +276,128 @@ def _job_view(job, include_logs=False):
     if include_logs:
         payload["logs"] = list(job.get("logs", []))
     return payload
+
+
+def _job_state_path(job_id):
+    return JOBS_DIR / f"{job_id}.json"
+
+
+def _job_output_exists(job):
+    output_file = str(job.get("output_file") or "").strip()
+    return bool(output_file and Path(output_file).exists())
+
+
+def _snapshot_job(job):
+    snapshot = dict(job)
+    snapshot["command"] = list(job.get("command", []))
+    payload = job.get("payload", {})
+    snapshot["payload"] = dict(payload) if isinstance(payload, dict) else payload
+    snapshot["logs"] = list(job.get("logs", []))
+    return snapshot
+
+
+def _persist_job_snapshot(snapshot):
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    target_path = _job_state_path(snapshot["id"])
+    temp_path = target_path.with_suffix(".json.tmp")
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(snapshot, handle, ensure_ascii=False, indent=2)
+    temp_path.replace(target_path)
+
+
+def _persist_job(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        snapshot = _snapshot_job(job)
+    _persist_job_snapshot(snapshot)
+
+
+def _recover_job_state(job):
+    recovered = _snapshot_job(job)
+    if recovered.get("status") in {"queued", "running"}:
+        recovered["status"] = "failed"
+        recovered["completed_at"] = recovered.get("completed_at") or _now_iso()
+        recovered["error"] = (
+            recovered.get("error")
+            or "Job was interrupted by a service restart before completion."
+        )
+        recovered["returncode"] = None
+        recovered.pop("started_monotonic", None)
+    return recovered
+
+
+def _load_job_from_disk(job_id):
+    state_path = _job_state_path(job_id)
+    if not state_path.exists():
+        return None
+
+    try:
+        with open(state_path, "r", encoding="utf-8") as handle:
+            job = json.load(handle)
+    except Exception:
+        return None
+
+    recovered = _recover_job_state(job)
+    if recovered != job:
+        _persist_job_snapshot(recovered)
+    return recovered
+
+
+def _load_jobs_from_disk():
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    for state_path in JOBS_DIR.glob("*.json"):
+        try:
+            with open(state_path, "r", encoding="utf-8") as handle:
+                job = json.load(handle)
+        except Exception:
+            continue
+
+        recovered = _recover_job_state(job)
+        job_id = recovered.get("id")
+        if not job_id:
+            continue
+
+        with JOBS_LOCK:
+            JOBS[job_id] = recovered
+
+        if recovered != job:
+            _persist_job_snapshot(recovered)
+
+
+def _get_job(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job:
+            return _snapshot_job(job)
+
+    recovered = _load_job_from_disk(job_id)
+    if not recovered:
+        return None
+
+    with JOBS_LOCK:
+        JOBS[job_id] = recovered
+    return _snapshot_job(recovered)
+
+
+def _read_job_output(job):
+    output_file = str(job.get("output_file") or "").strip()
+    if not output_file:
+        raise FileNotFoundError("This job does not have an output file.")
+
+    output_path = Path(output_file)
+    if not output_path.exists():
+        raise FileNotFoundError(f"Output file not found: {output_file}")
+
+    raw_text = output_path.read_text(encoding="utf-8")
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        return {"raw": raw_text}
+
+
+_load_jobs_from_disk()
 
 
 def _append_job_log(job_id, line):
@@ -287,6 +411,7 @@ def _append_job_log(job_id, line):
         if len(logs) > MAX_LOG_LINES:
             del logs[0 : len(logs) - MAX_LOG_LINES]
             job["log_truncated"] = True
+    _persist_job(job_id)
 
 
 def _summarize_jobs():
@@ -311,6 +436,7 @@ def _run_job(job_id):
             job["started_at"] = _now_iso()
             job["started_monotonic"] = time.monotonic()
             command = list(job["command"])
+        _persist_job(job_id)
 
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
@@ -340,10 +466,12 @@ def _run_job(job_id):
                 job["error"] = str(exc)
                 job["returncode"] = None
                 job.pop("started_monotonic", None)
+            _persist_job(job_id)
             return
 
         with JOBS_LOCK:
             JOBS[job_id]["pid"] = process.pid
+        _persist_job(job_id)
 
         if process.stdout is not None:
             for raw_line in process.stdout:
@@ -362,6 +490,7 @@ def _run_job(job_id):
             job["returncode"] = returncode
             job["status"] = "completed" if returncode == 0 else "failed"
             job.pop("started_monotonic", None)
+        _persist_job(job_id)
     except Exception as exc:
         with JOBS_LOCK:
             job = JOBS[job_id]
@@ -375,6 +504,7 @@ def _run_job(job_id):
             job["error"] = str(exc)
             job["returncode"] = None
             job.pop("started_monotonic", None)
+        _persist_job(job_id)
     finally:
         if acquired_slot:
             JOB_SEMAPHORE.release()
@@ -409,6 +539,7 @@ def _start_job(task_name, payload):
 
     with JOBS_LOCK:
         JOBS[job_id] = job
+    _persist_job(job_id)
 
     worker = threading.Thread(target=_run_job, args=(job_id,), daemon=True)
     worker.start()
@@ -460,6 +591,7 @@ class ScraperRequestHandler(BaseHTTPRequestHandler):
                         "GET /tasks": "Available tasks",
                         "GET /jobs": "List jobs",
                         "GET /jobs/<job_id>": "Get one job with recent logs",
+                        "GET /jobs/<job_id>/output": "Read one job's output JSON",
                         "POST /run/<task>": "Start one task",
                         "POST /run-all": "Start multiple tasks together",
                     },
@@ -501,15 +633,44 @@ class ScraperRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"jobs": jobs})
             return
 
-        if path.startswith("/jobs/"):
-            job_id = path.split("/", 2)[2]
-            with JOBS_LOCK:
-                job = JOBS.get(job_id)
-                payload = _job_view(job, include_logs=True) if job else None
-            if not payload:
+        path_parts = [part for part in path.split("/") if part]
+
+        if len(path_parts) == 3 and path_parts[0] == "jobs" and path_parts[2] == "output":
+            job_id = path_parts[1]
+            job = _get_job(job_id)
+            if not job:
                 self._send_json(404, {"error": "Job not found."})
                 return
-            self._send_json(200, payload)
+
+            try:
+                output_payload = _read_job_output(job)
+            except FileNotFoundError as exc:
+                status_code = 202 if job.get("status") in {"queued", "running"} else 404
+                self._send_json(
+                    status_code,
+                    {
+                        "error": str(exc),
+                        "job": _job_view(job),
+                    },
+                )
+                return
+
+            self._send_json(
+                200,
+                {
+                    "job": _job_view(job),
+                    "output": output_payload,
+                },
+            )
+            return
+
+        if len(path_parts) == 2 and path_parts[0] == "jobs":
+            job_id = path_parts[1]
+            job = _get_job(job_id)
+            if not job:
+                self._send_json(404, {"error": "Job not found."})
+                return
+            self._send_json(200, _job_view(job, include_logs=True))
             return
 
         self._send_json(404, {"error": "Route not found."})
