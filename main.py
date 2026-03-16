@@ -20,9 +20,18 @@ PORT = int(os.getenv("PORT") or os.getenv("SCRAPER_API_PORT", "8000"))
 MAX_LOG_LINES = 400
 JOBS = {}
 JOBS_LOCK = threading.Lock()
-JOB_MONGO_URI = os.getenv("SCRAPER_JOB_MONGO_URI", "").strip() or os.getenv("MONGO_URI", "").strip()
+DEFAULT_MONGO_URI = (
+    "mongodb+srv://alishakhan8488_db_user:DaVHn9goL8STNzNs@cluster0.nkmbpqt.mongodb.net/"
+    "studentcap?retryWrites=true&w=majority"
+)
+JOB_MONGO_URI = (
+    os.getenv("SCRAPER_JOB_MONGO_URI", "").strip()
+    or os.getenv("MONGO_URI", "").strip()
+    or DEFAULT_MONGO_URI
+)
 JOB_MONGO_DB = os.getenv("SCRAPER_JOB_MONGO_DB", "").strip() or os.getenv("MONGO_DB", "studentcap").strip()
 JOB_MONGO_COLLECTION = os.getenv("SCRAPER_JOB_MONGO_COLLECTION", "scraper_jobs").strip()
+JOB_STORE_WARNED = False
 
 
 def _env_int(name, default):
@@ -295,6 +304,14 @@ def _job_store_enabled():
     return bool(JOB_MONGO_URI)
 
 
+def _warn_job_store_issue(message):
+    global JOB_STORE_WARNED
+    if JOB_STORE_WARNED:
+        return
+    JOB_STORE_WARNED = True
+    print(f"[job-store] {message}", flush=True)
+
+
 def _job_collection():
     if not _job_store_enabled():
         return None, None
@@ -333,8 +350,8 @@ def _persist_job_snapshot(snapshot):
         client, collection = _job_collection()
         if collection is not None:
             collection.replace_one({"id": snapshot["id"]}, snapshot, upsert=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        _warn_job_store_issue(f"Mongo persist failed: {exc}")
     finally:
         if client is not None:
             client.close()
@@ -398,7 +415,8 @@ def _load_job_from_mongo(job_id):
         if recovered != job:
             collection.replace_one({"id": recovered["id"]}, recovered, upsert=True)
         return recovered
-    except Exception:
+    except Exception as exc:
+        _warn_job_store_issue(f"Mongo load failed for job {job_id}: {exc}")
         return None
     finally:
         if client is not None:
@@ -432,7 +450,8 @@ def _load_recent_jobs_from_mongo(limit=50):
 
             if recovered != job:
                 collection.replace_one({"id": recovered["id"]}, recovered, upsert=True)
-    except Exception:
+    except Exception as exc:
+        _warn_job_store_issue(f"Mongo recent-jobs load failed: {exc}")
         return
     finally:
         if client is not None:
