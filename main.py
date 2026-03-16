@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+from pymongo import MongoClient
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -19,6 +20,9 @@ PORT = int(os.getenv("PORT") or os.getenv("SCRAPER_API_PORT", "8000"))
 MAX_LOG_LINES = 400
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+JOB_MONGO_URI = os.getenv("SCRAPER_JOB_MONGO_URI", "").strip() or os.getenv("MONGO_URI", "").strip()
+JOB_MONGO_DB = os.getenv("SCRAPER_JOB_MONGO_DB", "").strip() or os.getenv("MONGO_DB", "studentcap").strip()
+JOB_MONGO_COLLECTION = os.getenv("SCRAPER_JOB_MONGO_COLLECTION", "scraper_jobs").strip()
 
 
 def _env_int(name, default):
@@ -287,6 +291,23 @@ def _job_output_exists(job):
     return bool(output_file and Path(output_file).exists())
 
 
+def _job_store_enabled():
+    return bool(JOB_MONGO_URI)
+
+
+def _job_collection():
+    if not _job_store_enabled():
+        return None, None
+
+    client = MongoClient(
+        JOB_MONGO_URI,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
+        socketTimeoutMS=5000,
+    )
+    return client, client[JOB_MONGO_DB][JOB_MONGO_COLLECTION]
+
+
 def _snapshot_job(job):
     snapshot = dict(job)
     snapshot["command"] = list(job.get("command", []))
@@ -303,6 +324,20 @@ def _persist_job_snapshot(snapshot):
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(snapshot, handle, ensure_ascii=False, indent=2)
     temp_path.replace(target_path)
+
+    if not _job_store_enabled():
+        return
+
+    client = None
+    try:
+        client, collection = _job_collection()
+        if collection is not None:
+            collection.replace_one({"id": snapshot["id"]}, snapshot, upsert=True)
+    except Exception:
+        pass
+    finally:
+        if client is not None:
+            client.close()
 
 
 def _persist_job(job_id):
@@ -345,6 +380,65 @@ def _load_job_from_disk(job_id):
     return recovered
 
 
+def _load_job_from_mongo(job_id):
+    if not _job_store_enabled():
+        return None
+
+    client = None
+    try:
+        client, collection = _job_collection()
+        if collection is None:
+            return None
+
+        job = collection.find_one({"id": job_id}, {"_id": 0})
+        if not job:
+            return None
+
+        recovered = _recover_job_state(job)
+        if recovered != job:
+            collection.replace_one({"id": recovered["id"]}, recovered, upsert=True)
+        return recovered
+    except Exception:
+        return None
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _load_recent_jobs_from_mongo(limit=50):
+    if not _job_store_enabled():
+        return
+
+    client = None
+    try:
+        client, collection = _job_collection()
+        if collection is None:
+            return
+
+        cursor = collection.find(
+            {},
+            {"_id": 0},
+        ).sort("created_at", -1).limit(max(1, int(limit)))
+
+        for job in cursor:
+            recovered = _recover_job_state(job)
+            job_id = recovered.get("id")
+            if not job_id:
+                continue
+
+            with JOBS_LOCK:
+                if job_id not in JOBS:
+                    JOBS[job_id] = recovered
+
+            if recovered != job:
+                collection.replace_one({"id": recovered["id"]}, recovered, upsert=True)
+    except Exception:
+        return
+    finally:
+        if client is not None:
+            client.close()
+
+
 def _load_jobs_from_disk():
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
     for state_path in JOBS_DIR.glob("*.json"):
@@ -365,6 +459,8 @@ def _load_jobs_from_disk():
         if recovered != job:
             _persist_job_snapshot(recovered)
 
+    _load_recent_jobs_from_mongo()
+
 
 def _get_job(job_id):
     with JOBS_LOCK:
@@ -373,6 +469,8 @@ def _get_job(job_id):
             return _snapshot_job(job)
 
     recovered = _load_job_from_disk(job_id)
+    if not recovered:
+        recovered = _load_job_from_mongo(job_id)
     if not recovered:
         return None
 
