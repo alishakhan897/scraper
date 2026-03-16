@@ -36,6 +36,15 @@ def _default_headless():
     } or os.getenv("RENDER", "").strip().lower() == "true"
 
 
+def _should_use_low_memory_mode():
+    flag = os.getenv("SCRAPER_LOW_MEMORY_MODE", "").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        return True
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    return os.getenv("RENDER", "").strip().lower() == "true"
+
+
 def _route_handler(route):
     if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
         route.abort()
@@ -1216,13 +1225,17 @@ def main():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=args.headless, args=BROWSER_ARGS)
-        context = browser.new_context(
-            user_agent=DEFAULT_USER_AGENT,
-            viewport={"width": 1440, "height": 1000},
-            locale="en-US",
-            service_workers="block",
-        )
-        context.route("**/*", _route_handler)
+        context_kwargs = {
+            "user_agent": DEFAULT_USER_AGENT,
+            "viewport": {"width": 1440, "height": 1000},
+            "locale": "en-US",
+        }
+        if _should_use_low_memory_mode():
+            context_kwargs["service_workers"] = "block"
+
+        context = browser.new_context(**context_kwargs)
+        if _should_use_low_memory_mode():
+            context.route("**/*", _route_handler)
         context.set_extra_http_headers({"Accept-Language": "en-US,en;q=0.9"})
         context.add_init_script(
             """

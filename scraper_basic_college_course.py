@@ -42,6 +42,15 @@ def _default_headless():
     } or os.getenv("RENDER", "").strip().lower() == "true"
 
 
+def _should_use_low_memory_mode():
+    flag = os.getenv("SCRAPER_LOW_MEMORY_MODE", "").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        return True
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    return os.getenv("RENDER", "").strip().lower() == "true"
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(
         description="Scrape Collegedunia courses with optional deep detail extraction."
@@ -2369,12 +2378,16 @@ def main():
             headless=args.headless,
             slow_mo=args.slow_mo,
         )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121",
-            viewport={"width": 1440, "height": 1000},
-            service_workers="block",
-        )
-        context.route("**/*", _route_handler)
+        context_kwargs = {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121",
+            "viewport": {"width": 1440, "height": 1000},
+        }
+        if _should_use_low_memory_mode():
+            context_kwargs["service_workers"] = "block"
+
+        context = browser.new_context(**context_kwargs)
+        if _should_use_low_memory_mode():
+            context.route("**/*", _route_handler)
         page = context.new_page()
 
         try:

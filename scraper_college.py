@@ -42,6 +42,15 @@ def _default_headless():
     } or os.getenv("RENDER", "").strip().lower() == "true"
 
 
+def _should_use_low_memory_mode():
+    flag = os.getenv("SCRAPER_LOW_MEMORY_MODE", "").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        return True
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    return os.getenv("RENDER", "").strip().lower() == "true"
+
+
 def _route_handler(route):
     if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
         route.abort()
@@ -2262,21 +2271,149 @@ def _build_location(city, state):
     return ", ".join(parts)
 
 
+FEE_SIGNAL_WORDS = ("fee", "fees", "tuition")
+FEE_BLOCK_WORDS = (
+    "package",
+    "salary",
+    "stipend",
+    "scholarship",
+    "income",
+    "expense",
+    "placement",
+    "award",
+    "exempt",
+    "waiver",
+    "per month",
+    "monthly",
+)
+FEE_AMOUNT_PATTERN = re.compile(
+    r"(?:₹|rs\.?|inr)\s*"
+    r"(?P<start>[\d,.]+)"
+    r"(?:\s*(?P<start_unit>crore|crores|cr|lakh|lakhs|lac|lacs|thousand|k))?"
+    r"(?:\s*(?:-|–|to)\s*"
+    r"(?P<end>[\d,.]+)"
+    r"(?:\s*(?P<end_unit>crore|crores|cr|lakh|lakhs|lac|lacs|thousand|k))?"
+    r")?",
+    re.IGNORECASE,
+)
+
+
+def _iter_fee_texts(value):
+    if value is None:
+        return
+
+    if isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_fee_texts(nested)
+        return
+
+    if isinstance(value, list):
+        if value and all(not isinstance(item, (dict, list, tuple, set)) for item in value):
+            joined = " ".join(" ".join(str(item or "").split()).strip() for item in value).strip()
+            if joined:
+                yield joined
+            return
+
+        for nested in value:
+            yield from _iter_fee_texts(nested)
+        return
+
+    text = " ".join(str(value or "").split()).strip()
+    if text:
+        yield text
+
+
+def _looks_like_fee_text(text):
+    lowered = text.lower()
+    return any(word in lowered for word in FEE_SIGNAL_WORDS) and not any(
+        word in lowered for word in FEE_BLOCK_WORDS
+    )
+
+
+def _to_inr_amount(raw_number, raw_unit):
+    try:
+        amount = float(str(raw_number).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+    unit = (raw_unit or "").strip().lower()
+    if unit in {"crore", "crores", "cr"}:
+        amount *= 10000000
+    elif unit in {"lakh", "lakhs", "lac", "lacs"}:
+        amount *= 100000
+    elif unit in {"thousand", "k"}:
+        amount *= 1000
+
+    return int(round(amount))
+
+
+def _extract_fee_amounts(text):
+    amounts = []
+    for match in FEE_AMOUNT_PATTERN.finditer(text or ""):
+        start_unit = match.group("start_unit")
+        end_unit = match.group("end_unit")
+
+        start_amount = _to_inr_amount(
+            match.group("start"),
+            start_unit or end_unit,
+        )
+        if start_amount:
+            amounts.append(start_amount)
+
+        end_raw = match.group("end")
+        if end_raw:
+            end_amount = _to_inr_amount(
+                end_raw,
+                end_unit or start_unit,
+            )
+            if end_amount:
+                amounts.append(end_amount)
+
+    return amounts
+
+
+def _derive_fee_fields(normalized):
+    fee_amounts = []
+    sections_to_scan = [
+        normalized.get("basic", {}),
+        normalized.get("admission", {}),
+        normalized.get("ranking", {}),
+        normalized.get("cutoff", {}),
+        normalized.get("scholarship", {}),
+    ]
+
+    for section in sections_to_scan:
+        for text in _iter_fee_texts(section):
+            if not _looks_like_fee_text(text):
+                continue
+            fee_amounts.extend(_extract_fee_amounts(text))
+
+    fee_amounts = sorted({amount for amount in fee_amounts if amount and amount > 0})
+    if not fee_amounts:
+        return None, {}
+
+    minimum = fee_amounts[0]
+    maximum = fee_amounts[-1]
+    average = int(round((minimum + maximum) / 2))
+
+    return average, {
+        "min": minimum,
+        "max": maximum,
+        "currency": "INR",
+    }
+
+
 def build_college_document(data, scrape_errors=None):
     normalized = _normalize_section_defaults(data)
     basic = normalized.get("basic", {}) if isinstance(normalized.get("basic"), dict) else {}
-    content = {
-        "basic": normalized.get("basic", {}),
-        "admission": normalized.get("admission", {}),
-        "reviews_page": normalized.get("reviews_page", {}),
-        "ranking": normalized.get("ranking", {}),
-        "placement": normalized.get("placement", {}),
-        "faculty": normalized.get("faculty", {"members": []}),
-        "cutoff": normalized.get("cutoff", {}),
-        "scholarship": normalized.get("scholarship", {}),
-        "gallery": normalized.get("gallery", []),
-        "qna": normalized.get("qna", []),
-    }
+    derived_avg_fees, derived_fees_range = _derive_fee_fields(normalized)
+    avg_fees = normalized.get("avg_fees")
+    fees_range = normalized.get("feesRange", {})
+
+    if avg_fees is None or avg_fees == "":
+        avg_fees = derived_avg_fees
+    if not fees_range:
+        fees_range = derived_fees_range
 
     document = {
         "source": SOURCE_NAME,
@@ -2290,24 +2427,23 @@ def build_college_document(data, scrape_errors=None):
         "reviewCount": basic.get("reviews"),
         "updatedAt": _now_iso(),
         "stream": normalized.get("stream", ""),
-        "avg_fees": normalized.get("avg_fees"),
-        "feesRange": normalized.get("feesRange", {}),
+        "avg_fees": avg_fees,
+        "feesRange": fees_range,
         "heroDownloaded": bool(normalized.get("heroImage")),
         "heroImage": normalized.get("heroImage", ""),
         "heroImages": normalized.get("heroImages", []),
         "accreditation": normalized.get("accreditation"),
         "affiliations": normalized.get("affiliations", []),
-        "content": content,
-        "basic": content["basic"],
-        "admission": content["admission"],
-        "reviews_page": content["reviews_page"],
-        "ranking": content["ranking"],
-        "placement": content["placement"],
-        "faculty": content["faculty"],
-        "cutoff": content["cutoff"],
-        "scholarship": content["scholarship"],
-        "gallery": content["gallery"],
-        "qna": content["qna"],
+        "basic": normalized.get("basic", {}),
+        "admission": normalized.get("admission", {}),
+        "reviews_page": normalized.get("reviews_page", {}),
+        "ranking": normalized.get("ranking", {}),
+        "placement": normalized.get("placement", {}),
+        "faculty": normalized.get("faculty", {"members": []}),
+        "cutoff": normalized.get("cutoff", {}),
+        "scholarship": normalized.get("scholarship", {}),
+        "gallery": normalized.get("gallery", []),
+        "qna": normalized.get("qna", []),
     }
     return document
 
@@ -2376,12 +2512,18 @@ def update_existing_college_placements(limit=None, headless=None):
             headless=_default_headless() if headless is None else headless,
             args=BROWSER_ARGS,
         )
+        context_kwargs = {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121",
+            "viewport": {"width": 1920, "height": 1080},
+        }
+        if _should_use_low_memory_mode():
+            context_kwargs["service_workers"] = "block"
+
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121",
-            viewport={"width": 1920, "height": 1080},
-            service_workers="block",
+            **context_kwargs
         )
-        context.route("**/*", _route_handler)
+        if _should_use_low_memory_mode():
+            context.route("**/*", _route_handler)
         page = context.new_page()
 
         try:
@@ -2450,12 +2592,18 @@ def main(target_url="", output_file="", headless=None):
             headless=_default_headless() if headless is None else headless,
             args=BROWSER_ARGS,
         )
+        context_kwargs = {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121",
+            "viewport": {"width": 1920, "height": 1080},
+        }
+        if _should_use_low_memory_mode():
+            context_kwargs["service_workers"] = "block"
+
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121",
-            viewport={"width": 1920, "height": 1080},
-            service_workers="block",
+            **context_kwargs
         )
-        context.route("**/*", _route_handler)
+        if _should_use_low_memory_mode():
+            context.route("**/*", _route_handler)
         page = context.new_page()
 
         try:
