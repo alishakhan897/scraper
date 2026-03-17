@@ -1130,8 +1130,10 @@ def scrape_ranking_toc(article):
     # Table of Content links
     toc_links = article.locator(
     "a[data-college_section_name='article'][href^='#']")
+    total_links = toc_links.count()
+    print(f"[ranking] TOC links found: {total_links}")
 
-    for i in range(toc_links.count()):
+    for i in range(total_links):
         link = toc_links.nth(i)
         title = link.inner_text().strip()
         href = link.get_attribute("href") or ""
@@ -1139,6 +1141,11 @@ def scrape_ranking_toc(article):
         anchor = None
         if "#" in href:
             anchor = href.split("#")[-1]
+
+        print(
+            f"[ranking] TOC {i+1}/{total_links}: "
+            f"title={title!r}, anchor={anchor!r}"
+        )
 
         # click TOC item (scrolls page)
         try:
@@ -1209,18 +1216,26 @@ def scrape_ranking_toc(article):
                 "content": section_content
             })
 
+        print(
+            f"[ranking] TOC {i+1}/{total_links} extracted "
+            f"{len(section_content)} content blocks"
+        )
+
     return toc_sections
 
 
 def scrape_ranking_page(page):
     ranking_data = {}
+    ranking_started_at = time.time()
 
     base_url = re.sub(r"/(admission|reviews|ranking|qna).*", "", page.url.rstrip("/"))
     ranking_url = base_url + "/ranking"
 
     print("Ã°Å¸â€œÅ  Opening Ranking page:", ranking_url)
     page.goto(ranking_url, wait_until="domcontentloaded")
+    print(f"[ranking] navigation complete: url={page.url}")
     page.wait_for_selector("#listing-article", timeout=30000)
+    print("[ranking] #listing-article is ready")
     time.sleep(1)
 
     article = page.locator("#listing-article")
@@ -1236,11 +1251,14 @@ def scrape_ranking_page(page):
     about = scrape_ranking_about(article)
     if about:
         ranking_data["about"] = about
+    print(f"[ranking] about blocks collected: {len(about)}")
 
     # ---------- TOC (ANCHOR BASED) ----------
     toc_sections = scrape_ranking_toc(article)
     if toc_sections:
         ranking_data["toc_sections"] = toc_sections
+    print(f"[ranking] TOC sections collected: {len(toc_sections)}")
+    print(f"[ranking] scrape completed in {time.time() - ranking_started_at:.1f}s")
 
     return ranking_data
 
