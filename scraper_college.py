@@ -7,6 +7,7 @@ import argparse
 import os
 from datetime import datetime, timezone
 from pymongo import MongoClient
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 try:
     # Avoid Windows cp1252 print crashes from Unicode text in logs.
@@ -15,7 +16,7 @@ try:
 except:
     pass
 
-DEFAULT_URL = "https://collegedunia.com/university/25455-iit-delhi-indian-institute-of-technology-iitd-new-delhi"
+DEFAULT_URL = "https://collegedunia.com/university/13752-iilm-university-greater-noida"
 DEFAULT_OUTPUT_FILE = "iim_knp_full_dump.json"
 MONGO_URI = os.getenv(
     "MONGO_URI",
@@ -31,6 +32,14 @@ BROWSER_ARGS = [
     "--disable-setuid-sandbox",
 ]
 BLOCKED_RESOURCE_TYPES = {"image", "font", "media"}
+RESILIENT_WAIT_SELECTORS = {"#listing-article", "div.img-container img"}
+
+
+def _env_int(name, default, minimum=1):
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
 
 
 def _default_headless():
@@ -48,7 +57,120 @@ def _should_use_low_memory_mode():
         return True
     if flag in {"0", "false", "no", "off"}:
         return False
-    return os.getenv("RENDER", "").strip().lower() == "true"
+    return False
+
+
+def _runtime_navigation_timeout_ms():
+    return _env_int(
+        "SCRAPER_NAVIGATION_TIMEOUT_MS",
+        90000 if _default_headless() else 60000,
+    )
+
+
+def _runtime_selector_timeout_ms():
+    return _env_int(
+        "SCRAPER_SELECTOR_TIMEOUT_MS",
+        60000 if _default_headless() else 30000,
+    )
+
+
+def _runtime_retry_attempts():
+    default_attempts = 2 if (_default_headless() or os.getenv("RENDER", "").strip().lower() == "true") else 1
+    return _env_int("SCRAPER_RUNTIME_RETRY_ATTEMPTS", default_attempts)
+
+
+class ResilientPage:
+    def __init__(self, page):
+        self._page = page
+
+    def __getattr__(self, name):
+        return getattr(self._page, name)
+
+    def goto(self, url, **kwargs):
+        return self._retry_navigation(self._page.goto, url, **kwargs)
+
+    def reload(self, **kwargs):
+        return self._retry_navigation(self._page.reload, **kwargs)
+
+    def go_back(self, **kwargs):
+        start_url = (self._page.url or "").strip()
+        try:
+            return self._retry_navigation(self._page.go_back, **kwargs)
+        except PlaywrightTimeoutError:
+            current_url = (self._page.url or "").strip()
+            if current_url and current_url != start_url and current_url != "about:blank":
+                try:
+                    self._page.wait_for_timeout(1200)
+                except Exception:
+                    pass
+                return None
+            raise
+
+    def wait_for_selector(self, selector, **kwargs):
+        if selector not in RESILIENT_WAIT_SELECTORS:
+            return self._page.wait_for_selector(selector, **kwargs)
+
+        timeout = kwargs.get("timeout")
+        kwargs["timeout"] = max(int(timeout), _runtime_selector_timeout_ms()) if timeout else _runtime_selector_timeout_ms()
+        attempts = _runtime_retry_attempts()
+        last_error = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._page.wait_for_selector(selector, **kwargs)
+            except PlaywrightTimeoutError as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    raise
+
+                try:
+                    self._page.wait_for_load_state("domcontentloaded", timeout=2000)
+                except Exception:
+                    pass
+
+                try:
+                    self._page.wait_for_timeout(1200 * attempt)
+                except Exception:
+                    pass
+
+                try:
+                    self._page.reload(
+                        wait_until="domcontentloaded",
+                        timeout=_runtime_navigation_timeout_ms(),
+                    )
+                except Exception:
+                    pass
+
+        raise last_error
+
+    def wait_for_load_state(self, state="load", **kwargs):
+        try:
+            return self._page.wait_for_load_state(state, **kwargs)
+        except PlaywrightTimeoutError:
+            if state == "networkidle":
+                return None
+            raise
+
+    def _retry_navigation(self, fn, *args, **kwargs):
+        timeout = kwargs.get("timeout")
+        kwargs["timeout"] = max(int(timeout), _runtime_navigation_timeout_ms()) if timeout else _runtime_navigation_timeout_ms()
+        attempts = _runtime_retry_attempts()
+        last_error = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                return fn(*args, **kwargs)
+            except PlaywrightTimeoutError as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    raise
+
+                try:
+                    self._page.wait_for_timeout(1200 * attempt)
+                except Exception:
+                    pass
+
+        raise last_error
 
 
 def _route_handler(route):
@@ -2524,7 +2646,10 @@ def update_existing_college_placements(limit=None, headless=None):
         )
         if _should_use_low_memory_mode():
             context.route("**/*", _route_handler)
-        page = context.new_page()
+        raw_page = context.new_page()
+        raw_page.set_default_navigation_timeout(_runtime_navigation_timeout_ms())
+        raw_page.set_default_timeout(_runtime_selector_timeout_ms())
+        page = ResilientPage(raw_page)
 
         try:
             for index, college in enumerate(colleges, start=1):
@@ -2604,7 +2729,10 @@ def main(target_url="", output_file="", headless=None):
         )
         if _should_use_low_memory_mode():
             context.route("**/*", _route_handler)
-        page = context.new_page()
+        raw_page = context.new_page()
+        raw_page.set_default_navigation_timeout(_runtime_navigation_timeout_ms())
+        raw_page.set_default_timeout(_runtime_selector_timeout_ms())
+        page = ResilientPage(raw_page)
 
         try:
             print("Navigating...")

@@ -121,6 +121,18 @@ def _append_bool_flag(command, payload, payload_key, cli_flag):
         command.append(cli_flag)
 
 
+def _append_headless_args(command, payload):
+    if "headless" not in payload:
+        if _should_run_headless(payload):
+            command.append("--headless")
+        return
+
+    if bool(payload.get("headless")):
+        command.append("--headless")
+    else:
+        command.append("--headed")
+
+
 def _should_run_headless(payload):
     if "headless" in payload:
         return bool(payload.get("headless"))
@@ -160,8 +172,7 @@ def _build_basic_course_command(payload, output_file):
         "--output-file",
         output_file,
     ]
-    if _should_run_headless(payload):
-        command.append("--headless")
+    _append_headless_args(command, payload)
     _append_int_arg(command, payload, "slow_mo", "--slow-mo")
     _append_int_arg(command, payload, "limit_courses", "--limit-courses")
     _append_int_arg(command, payload, "limit_sub_courses", "--limit-sub-courses")
@@ -185,8 +196,7 @@ def _build_course_command(payload, output_file):
         "--output-file",
         output_file,
     ]
-    if _should_run_headless(payload):
-        command.append("--headless")
+    _append_headless_args(command, payload)
     _append_int_arg(command, payload, "stream_limit", "--stream-limit")
     _append_int_arg(command, payload, "course_limit", "--course-limit")
     return command
@@ -202,8 +212,7 @@ def _build_college_command(payload, output_file):
         "--output-file",
         output_file,
     ]
-    if _should_run_headless(payload):
-        command.append("--headless")
+    _append_headless_args(command, payload)
     return command
 
 
